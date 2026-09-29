@@ -28,9 +28,14 @@ st.sidebar.info(f"Permitted Tables: {', '.join(allowed_tables)}")
 
 def get_db():
     return SQLDatabase.from_uri(
-        db_uri, 
-        include_tables=allowed_tables, 
-        sample_rows_in_table_info=2
+        db_uri,
+        include_tables=allowed_tables,
+        sample_rows_in_table_info=2,
+        engine_args={
+            "connect_args": {
+                "ssl": {"ca": None} 
+            }
+        }
     )
 
 def clean_sql(raw: str) -> str:
