@@ -13,7 +13,7 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="AI Database Assistant", page_icon="🤖", layout="wide")
 st.title("🤖 AI Database Assistant")
 
-# Get API Key and Database URI from Streamlit Secrets 
+# Retrieve API Key and Database URI from Streamlit Secrets
 gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
 db_uri = st.secrets.get("MYSQL_URI", "")
 
@@ -42,7 +42,7 @@ def clean_sql(raw: str) -> str:
     cleaned = re.sub(r"```(?:sql)?", "", raw, flags=re.IGNORECASE)
     return cleaned.replace("```", "").strip()
 
-# Chat History Session State
+# Initialize session state for chat history
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
@@ -50,7 +50,7 @@ for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-user_query = st.chat_input("Database එකෙන් දැනගන්න ඕන දේ අහන්න (සිංහල / English)...")
+user_query = st.chat_input("Ask a question about the database (English / Sinhala)...")
 
 if user_query:
     st.session_state.chat_history.append({"role": "user", "content": user_query})
@@ -62,40 +62,72 @@ if user_query:
             try:
                 db = get_db()
                 
-                # Use stable Gemini model
+                # Initialize LLM with the specified model
                 llm = ChatGoogleGenerativeAI(
                     model="gemini-3.5-flash-lite", 
                     google_api_key=gemini_api_key, 
                     timeout=30.0
                 )
 
-                # 1. SQL Prompt
+                # 1. SQL Generation Prompt with strict domain guardrails
                 sql_prompt = ChatPromptTemplate.from_messages([
-                    ("system", "You are a MySQL expert. Output ONLY a valid raw SQL query to answer the question. Do NOT include explanations or markdown.\n\nSchema:\n{schema}"),
+                    ("system", """You are an Enterprise MySQL AI Assistant.
+Convert user questions into executable MySQL queries strictly against the provided schema.
+
+RULES:
+1. Only generate SQL if the question can be answered using the provided database schema:
+{schema}
+2. If the user question is NOT related to the database tables (e.g., general knowledge, politics, presidents, geography, personal questions), output EXACTLY: NOT_RELEVANT
+3. Do NOT execute destructive statements (DROP, DELETE, TRUNCATE, ALTER).
+4. Output ONLY the raw executable SQL query or NOT_RELEVANT. Do NOT include markdown code blocks or explanations."""),
                     ("human", "{question}")
                 ])
                 sql_chain = sql_prompt | llm | StrOutputParser()
                 generated_sql = clean_sql(sql_chain.invoke({"schema": db.get_table_info(), "question": user_query}))
 
-                with st.expander("🛠️ Generated SQL"):
-                    st.code(generated_sql, language="sql")
+                # Handle out-of-scope queries
+                if "NOT_RELEVANT" in generated_sql.upper():
+                    scope_prompt = ChatPromptTemplate.from_messages([
+                        ("system", """Politely explain to the user that you can only answer questions related to the company database (Customers, Products, Orders).
+STRICT LANGUAGE RULE:
+- If the user asked in English, reply in English.
+- If the user asked in Sinhala, reply in natural Sinhala."""),
+                        ("human", "{question}")
+                    ])
+                    scope_chain = scope_prompt | llm | StrOutputParser()
+                    response = scope_chain.invoke({"question": user_query})
 
-                # 2. Database Run
-                try:
-                    db_result = db.run(generated_sql)
-                except Exception as db_err:
-                    db_result = f"Query Execution Error: {str(db_err)}"
+                    st.warning(response)
+                    st.session_state.chat_history.append({"role": "assistant", "content": response})
 
-                # 3. Answer Prompt
-                ans_prompt = ChatPromptTemplate.from_messages([
-                    ("system", "Answer concisely based on the query and result. If queried in Sinhala, reply in natural Sinhala."),
-                    ("human", "Question: {question}\nSQL: {query}\nResult: {result}")
-                ])
-                ans_chain = ans_prompt | llm | StrOutputParser()
-                response = ans_chain.invoke({"question": user_query, "query": generated_sql, "result": db_result})
+                else:
+                    # Display generated SQL inside an expander
+                    with st.expander("🛠️ Generated SQL"):
+                        st.code(generated_sql, language="sql")
 
-                st.markdown(response)
-                st.session_state.chat_history.append({"role": "assistant", "content": response})
+                    # 2. Execute SQL query on the database
+                    try:
+                        db_result = db.run(generated_sql)
+                    except Exception as db_err:
+                        db_result = f"Query Execution Error: {str(db_err)}"
+
+                    # 3. Answer Generation with strict language-matching rule
+                    ans_prompt = ChatPromptTemplate.from_messages([
+                        ("system", """You are a professional enterprise database assistant.
+Synthesize a concise, accurate answer based on the SQL query and its execution result.
+
+CRITICAL LANGUAGE RULE:
+- Always reply in the EXACT language used in the user's question.
+- If the question is in English, reply entirely in English.
+- If the question is in Sinhala, reply in natural Sinhala.
+- Do NOT switch languages or mix words unnaturally."""),
+                        ("human", "Question: {question}\nSQL: {query}\nResult: {result}")
+                    ])
+                    ans_chain = ans_prompt | llm | StrOutputParser()
+                    response = ans_chain.invoke({"question": user_query, "query": generated_sql, "result": db_result})
+
+                    st.markdown(response)
+                    st.session_state.chat_history.append({"role": "assistant", "content": response})
 
             except Exception as e:
                 err = f"Error: {str(e)}"
