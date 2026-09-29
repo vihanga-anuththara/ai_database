@@ -21,7 +21,7 @@ if not gemini_api_key or not db_uri:
     st.error("Missing Secrets: Please configure GEMINI_API_KEY and MYSQL_URI.")
     st.stop()
 
-# Role-Based Access Control (RBAC)
+# Role-Based Access Control (RBAC) Setup
 role = st.sidebar.selectbox("Role:", ["Sales_Rep", "Inventory_Manager"])
 allowed_tables = ["customers", "orders", "products"] if role == "Sales_Rep" else ["products"]
 st.sidebar.info(f"Permitted Tables: {', '.join(allowed_tables)}")
@@ -62,33 +62,65 @@ if user_query:
             try:
                 db = get_db()
                 
-                # Initialize LLM with the specified model
+                # Initialize Gemini LLM
                 llm = ChatGoogleGenerativeAI(
                     model="gemini-3.5-flash-lite", 
                     google_api_key=gemini_api_key, 
                     timeout=30.0
                 )
 
-                # 1. SQL Generation Prompt with strict domain guardrails
+                # 1. SQL Generation with RBAC and Scope Rules
                 sql_prompt = ChatPromptTemplate.from_messages([
                     ("system", """You are an Enterprise MySQL AI Assistant.
-Convert user questions into executable MySQL queries strictly against the provided schema.
+The current logged-in role is '{current_role}'.
+This role has permission ONLY for these tables: {permitted_tables}.
+The full enterprise database contains: 'customers', 'orders', and 'products'.
 
-RULES:
-1. Only generate SQL if the question can be answered using the provided database schema:
-{schema}
-2. If the user question is NOT related to the database tables (e.g., general knowledge, politics, presidents, geography, personal questions), output EXACTLY: NOT_RELEVANT
-3. Do NOT execute destructive statements (DROP, DELETE, TRUNCATE, ALTER).
-4. Output ONLY the raw executable SQL query or NOT_RELEVANT. Do NOT include markdown code blocks or explanations."""),
+STRICT RULES:
+1. If the user's question asks for data in tables outside their permitted scope (for example, an Inventory Manager asking about customers or orders/sales):
+   Output EXACTLY: PERMISSION_DENIED
+2. If the question is completely unrelated to the company database (e.g. general knowledge, politics, personal questions):
+   Output EXACTLY: NOT_RELEVANT
+3. If the question is valid and within their permitted schema ({schema}):
+   Output ONLY the raw executable MySQL query. No markdown, no commentary, no destructive statements."""),
                     ("human", "{question}")
                 ])
                 sql_chain = sql_prompt | llm | StrOutputParser()
-                generated_sql = clean_sql(sql_chain.invoke({"schema": db.get_table_info(), "question": user_query}))
+                generated_sql = clean_sql(sql_chain.invoke({
+                    "current_role": role,
+                    "permitted_tables": ", ".join(allowed_tables),
+                    "schema": db.get_table_info(), 
+                    "question": user_query
+                }))
 
-                # Handle out-of-scope queries
-                if "NOT_RELEVANT" in generated_sql.upper():
+                # Handle Permission Denied (RBAC Restriction)
+                if "PERMISSION_DENIED" in generated_sql.upper():
+                    rbac_prompt = ChatPromptTemplate.from_messages([
+                        ("system", """Inform the user that access is denied based on their role.
+State clearly:
+- Their current role is '{current_role}'.
+- They only have access to: {permitted_tables}.
+- They do not have permission to view other data (like customers or orders).
+
+STRICT LANGUAGE RULE:
+- If the user asked in English, reply in English.
+- If the user asked in Sinhala, reply in natural Sinhala."""),
+                        ("human", "{question}")
+                    ])
+                    rbac_chain = rbac_prompt | llm | StrOutputParser()
+                    response = rbac_chain.invoke({
+                        "current_role": role,
+                        "permitted_tables": ", ".join(allowed_tables),
+                        "question": user_query
+                    })
+
+                    st.error(response)
+                    st.session_state.chat_history.append({"role": "assistant", "content": response})
+
+                # Handle General Knowledge / Out-of-Scope Queries
+                elif "NOT_RELEVANT" in generated_sql.upper():
                     scope_prompt = ChatPromptTemplate.from_messages([
-                        ("system", """Politely explain to the user that you can only answer questions related to the company database (Customers, Products, Orders).
+                        ("system", """Politely explain to the user that you can only answer questions related to the company database.
 STRICT LANGUAGE RULE:
 - If the user asked in English, reply in English.
 - If the user asked in Sinhala, reply in natural Sinhala."""),
@@ -100,18 +132,16 @@ STRICT LANGUAGE RULE:
                     st.warning(response)
                     st.session_state.chat_history.append({"role": "assistant", "content": response})
 
+                # Handle Valid Allowed Queries
                 else:
-                    # Display generated SQL inside an expander
                     with st.expander("🛠️ Generated SQL"):
                         st.code(generated_sql, language="sql")
 
-                    # 2. Execute SQL query on the database
                     try:
                         db_result = db.run(generated_sql)
                     except Exception as db_err:
                         db_result = f"Query Execution Error: {str(db_err)}"
 
-                    # 3. Answer Generation with strict language-matching rule
                     ans_prompt = ChatPromptTemplate.from_messages([
                         ("system", """You are a professional enterprise database assistant.
 Synthesize a concise, accurate answer based on the SQL query and its execution result.
@@ -119,8 +149,7 @@ Synthesize a concise, accurate answer based on the SQL query and its execution r
 CRITICAL LANGUAGE RULE:
 - Always reply in the EXACT language used in the user's question.
 - If the question is in English, reply entirely in English.
-- If the question is in Sinhala, reply in natural Sinhala.
-- Do NOT switch languages or mix words unnaturally."""),
+- If the question is in Sinhala, reply in natural Sinhala."""),
                         ("human", "Question: {question}\nSQL: {query}\nResult: {result}")
                     ])
                     ans_chain = ans_prompt | llm | StrOutputParser()
